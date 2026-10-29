@@ -1,111 +1,154 @@
-# Azure Zero-Trust PaaS Architecture Lab
+# Enterprise Zero-Trust PaaS Architecture — Microsoft Azure
 
-> **Enterprise Zero-Trust PaaS architectuur op Microsoft Azure** — Volledige netwerk-isolatie en identiteitsbeveiliging van Azure App Service, Azure SQL Database en Azure Key Vault via Private Endpoints, Private DNS Zones, VNet-Integratie en Microsoft Entra ID Managed Identities.
+Ontwerp, implementatie en end-to-end validatie van een enterprise Zero-Trust Platform-as-a-Service (PaaS) architectuur op Microsoft Azure. Volledige netwerkisolatie en identiteitsbeveiliging van **Azure App Service**, **Azure SQL Database** en **Azure Key Vault** via **Private Endpoints (Azure Private Link)**, **Private DNS Zones**, **Regional VNet Integration** en **Microsoft Entra ID Managed Identities**.
 
 ---
 
-## 📌 Architectuuroverzicht
+## 🎯 Doel
 
-Traditionele cloud-applicaties vertrouwen vaak op publieke IP-adressen met firewall-regels en statische connection strings. Dit lab implementeert het **Zero-Trust principe ("Never Trust, Always Verify", "Assume Breach")** door:
-1. **Publieke toegang uit te schakelen (`publicNetworkAccess = Disabled`)** op zowel de data-tier (Azure SQL) als de secrets-tier (Azure Key Vault).
-2. **Private Endpoints (Azure Private Link)** in te richten waardoor PaaS-diensten uitsluitend communiceren over interne IPv4-adressen (`10.20.2.x`).
-3. **Azure Private DNS Zones** (`privatelink.database.windows.net` en `privatelink.vaultcore.azure.net`) te koppelen voor transparante CNAME-resolutie.
-4. **Regional VNet Integration** met `Route All` te configureren op de Azure App Service.
-5. **System-Assigned Managed Identity** en **Azure RBAC (`Key Vault Secrets User`)** toe te passen, waardoor statische wachtwoorden en connection strings overbodig zijn.
+Aantonen dat ik een enterprise-grade, compliance-ready **Zero-Trust PaaS** cloudarchitectuur kan ontwerpen, via een **hybride methode (Azure CLI + Azure Portal)** kan bouwen en beveiligen:
+- **Zero-Exposure PaaS**: Backend services (SQL Database & Key Vault) draaien met `publicNetworkAccess: Disabled` — fysiek onbereikbaar vanaf het internet.
+- **Azure Private Link & DNS CNAME Ketens**: Privé IPv4-adressering (`10.20.2.x`) binnen het Virtual Network met automatische FQDN-resolutie via Private DNS Zones.
+- **Regional VNet Integration & Subnet Delegatie**: Uitgaand verkeer van de Linux App Service forceren via een afgeschermd subnet met `Route All = Enabled` en delegatie naar `Microsoft.Web/serverFarms`.
+- **Wachtwoordloze Authenticatie (Zero Credentials)**: Volledige eliminatie van connection strings en wachtwoorden door inzet van **System-Assigned Managed Identity** en granulaire **Azure RBAC** (`Key Vault Secrets User`).
+- **Real-World Incident Response & Troubleshooting**: Oplossen van Azure datacenter quota-restricties (`RequestDisallowedByAzure` & `RegionDoesNotAllowProvisioning`), namespace registraties en cross-region architectuuroverwegingen.
+- **FinOps & Resource Lifecycle**: Kostenbeheersing door gestructureerd resourcebeheer en geautomatiseerde teardown (`cleanup.ps1`).
 
-```mermaid
-flowchart TD
-    subgraph Internet ["🌐 Publiek Internet"]
-        User["Gebruiker / Webverkeer"]
-        Attacker["Onbevoegde Aanvaller"]
-    end
+---
 
-    subgraph Azure_Cloud ["☁️ Microsoft Azure"]
-        subgraph Frontend ["Frontend Tier"]
-            AppService["Azure App Service (Linux Web App)\napp-zerotrust-lab-4405\nManaged Identity Enabled"]
-        end
+## 🏗️ Architectuur & Netwerkontwerp
 
-        subgraph VNet ["Virtual Network (vnet-francecentral-lab / vnet-zerotrust-lab)"]
-            subgraph Subnet_App ["snet-app-fc (10.30.1.0/24)\nDelegation: Microsoft.Web/serverFarms"]
-                VNetInteg["VNet Integration Routering\n(Route All = Enabled)"]
-            end
-
-            subgraph Subnet_PE ["snet-private-endpoints (10.20.2.0/24)"]
-                PESQL["pe-sql\nNIC: 10.20.2.5\nPoort: 1433"]
-                PEKV["pe-keyvault\nNIC: 10.20.2.4\nPoort: 443"]
-            end
-
-            subgraph PrivateDNS ["Azure Private DNS Zones"]
-                DNS1["privatelink.database.windows.net\nsql-zt-9935 -> 10.20.2.5"]
-                DNS2["privatelink.vaultcore.azure.net\nkv-zt-26595 -> 10.20.2.4"]
-            end
-        end
-
-        subgraph Backend_PaaS ["Data & Secrets Tier (Zero-Trust)"]
-            SQL["Azure SQL Database\nsql-zt-9935 / sqldb-lab\nPublic Access: Disabled"]
-            KV["Azure Key Vault\nkv-zt-26595\nRBAC: Key Vault Secrets User\nPublic Access: Disabled"]
-        end
-    end
-
-    User -->|HTTPS :443| AppService
-    Attacker -.->|GEBLOKKEERD: Public Access Disabled| SQL
-    Attacker -.->|GEBLOKKEERD: Public Access Disabled| KV
-    AppService -->|Outbound VNet Tunnel| VNetInteg
-    VNetInteg -->|Interne DNS Lookup| PrivateDNS
-    VNetInteg -->|Privé Verkeer :1433| PESQL
-    VNetInteg -->|Privé Verkeer :443| PEKV
-    PESQL ===>|Private Link Backbone| SQL
-    PEKV ===>|Private Link Backbone| KV
+```
+                                [ Publiek Internet ]
+                                          │
+                                          │ HTTPS (Poort 443)
+                                          ▼
+                      ┌───────────────────────────────────────┐
+                      │    app-zerotrust-lab-4405 (Linux)     │
+                      │  • SKU: Basic B1 (France Central)     │
+                      │  • System-Assigned Managed Identity   │
+                      │    OID: 88e1b2f9-2169-4691-...        │
+                      └───────────────────┬───────────────────┘
+                                          │ Regional VNet Integration
+                                          │ (Route All: Enabled)
+                                          ▼
+                      ┌───────────────────────────────────────┐
+                      │    vnet-francecentral-lab / Hub       │
+                      │  • snet-app-fc: 10.30.1.0/24          │
+                      │    (Delegation: serverFarms)          │
+                      └───────────────────┬───────────────────┘
+                                          │ Interne backbone
+                                          ▼
+                      ┌───────────────────────────────────────┐
+                      │  snet-private-endpoints (10.20.2.0/24)│
+                      │                                       │
+                      │  [ pe-sql ]       [ pe-keyvault ]     │
+                      │   10.20.2.5        10.20.2.4          │
+                      │  (Poort 1433)     (Poort 443)         │
+                      └─────────┬─────────────────┬───────────┘
+                                │                 │
+        Private Link Backbone   │                 │   Private Link Backbone
+                                ▼                 ▼
+        ┌──────────────────────────────┐   ┌──────────────────────────────┐
+        │       Azure SQL Server       │   │       Azure Key Vault        │
+        │         sql-zt-9935          │   │         kv-zt-26595          │
+        │   Database: sqldb-lab        │   │   RBAC: Secrets User         │
+        │   Public Access: DISABLED ❌ │   │   Public Access: DISABLED ❌ │
+        └──────────────────────────────┘   └──────────────────────────────┘
+                       ▲                                  ▲
+                       │                                  │
+       [ Onbevoegde Aanvaller / Internet ] ───────────────┘
+          (❌ Fysiek GEBLOKKEERD door Zero-Trust Firewall)
 ```
 
 ---
 
-## 🛠️ Hybride Implementatie: CLI & Azure Portal
+## 📋 Componenten & Specificaties
 
-Het lab is bewust opgezet via een **hybride aanpak** om zowel automation/scripting als portal- en security engineering te demonstreren:
-
-| Onderdeel | Methode | Uitgevoerde Acties |
-| :--- | :--- | :--- |
-| **Infrastructuur Fundament** | **Azure CLI / Cloud Shell** | Resource Groups, VNets, Subnet Delegation (`Microsoft.Web/serverFarms`), Private DNS Zones & VNet Links. |
-| **PaaS & Private Endpoints** | **Azure CLI / Cloud Shell** | Key Vault met RBAC & Public Access Disabled, SQL Server & DB, Private Endpoints (`pe-keyvault`, `pe-sql`), DNS Zone Groups. |
-| **Web App Provisioning** | **Azure Portal** | Linux App Service Plan, Web App instellingen, SKU configuratie. |
-| **Netwerkintegratie** | **Azure Portal** | Regional VNet Integration koppeling, Toepassingsrouting / Route All activatie. |
-| **Zero-Trust Identity & IAM** | **Azure Portal** | System-Assigned Managed Identity genereren, Azure RBAC toewijzing (`Key Vault Secrets User`). |
-| **Validatie & Troubleshooting** | **SSH / CLI / Portal** | Public Access block verificatie, SSH DNS Lookups (`nslookup` naar 10.20.2.x). |
+| Component | Resource Naam | Subnet / IP-Bereik | Specificaties | Doel / Functie |
+|---|---|---|---|---|
+| **Resource Group** | `rg-zerotrust-paas-lab` | Regio: `North Europe / France Central` | N.v.t. | Centrale lifecycle container voor alle lab-resources |
+| **Virtual Network** | `vnet-francecentral-lab` | `10.30.0.0/16` | DNS: Default Azure | Private netwerklaag voor de backend workloads |
+| **App Subnet** | `snet-app-fc` | `10.30.1.0/24` | Delegation: `serverFarms` | Dedicated integratiesubnet voor de Web App |
+| **Private Endpoint Subnet**| `snet-private-endpoints` | `10.20.2.0/24` | Policies Disabled | Subnet voor netwerkinterfaces van Private Link |
+| **Web App** | `app-zerotrust-lab-4405` | VNet Outbound | Python 3.11 / Linux (B1) | Frontend web-applicatie met Managed Identity |
+| **Azure SQL Server** | `sql-zt-9935` | Private IP: `10.20.2.5` | Basic Tier (`sqldb-lab`) | Beveiligde database met `publicNetworkAccess: Disabled` |
+| **Azure Key Vault** | `kv-zt-26595` | Private IP: `10.20.2.4` | RBAC Authorized | Opslag van geheimen met `publicNetworkAccess: Disabled` |
+| **Private DNS SQL** | `privatelink.database.windows.net` | Global / VNet Link | A-record naar `10.20.2.5` | DNS-vertaling van SQL Server FQDN |
+| **Private DNS Vault** | `privatelink.vaultcore.azure.net` | Global / VNet Link | A-record naar `10.20.2.4` | DNS-vertaling van Key Vault FQDN |
 
 ---
 
-## 🧪 Validatie & Bewijsvoering
+## 🛠️ Hybride Implementatiemethode (CLI & Portal)
 
-### 1. Publieke Toegang Keihard Geblokkeerd (Assume Breach)
-Wanneer een gebruiker via het internet (zelfs via het Azure Portal) de Key Vault geheimen probeert in te zien, wordt dit direct geweigerd door het Zero-Trust beleid:
-> `De bewerking is niet toegestaan door RBAC... U hebt geen machtiging om deze inhoud weer te geven.`
+Het lab is bewust uitgevoerd in een **50/50 hybride opzet** om zowel command-line automation als diepgaande Azure Portal configuratie aan te tonen:
 
-### 2. Private DNS & Netwerk Routering via SSH Console
-Vanuit de Linux Web App SSH sessie resolven alle backend endpoints automatisch naar hun interne privé-adressen:
+1. **Eerste Helft (Azure CLI / Cloud Shell)**:
+   - Resource Groups, Virtual Networks, subnet delegaties en routering.
+   - Private DNS Zones aanmaken en koppelen aan de VNets via Virtual Network Links.
+   - Azure Key Vault en Azure SQL Database provisionen met `--public-network-access Disabled`.
+   - Private Endpoints (`pe-sql` en `pe-keyvault`) uitrollen en DNS Zone Groups koppelen.
+
+2. **Tweede Helft (Azure Portal)**:
+   - Resource Group overzicht en netwerktopologie inspecteren.
+   - App Service (Linux Web App) aanmaken en afstemmen op beschikbare compute-quota.
+   - **Regional VNet Integration** inschakelen en verbinden met het gedelegeerde subnet.
+   - **System-Assigned Managed Identity** activeren en het Entra ID Object-ID verifiëren.
+   - **Azure RBAC Roltoewijzing** (`Key Vault Secrets User`) configureren onder Access Control (IAM).
+   - Validatietesten uitvoeren vanuit de ingebouwde SSH-console.
+
+---
+
+## 🧪 Validatie & Zero-Trust Bewijsvoering
+
+### 1. Test 1: Publieke Internettoegang Geblokkeerd (Assume Breach)
+Wanneer een gebruiker via het internet (zelfs ingelogd in het Azure Portal) probeert de geheimen in de Key Vault te bekijken, weigert Azure categorisch de toegang:
+> ⚠️ **"De bewerking is niet toegestaan door RBAC... U hebt geen machtiging om deze inhoud weer te geven."**
+
+### 2. Test 2: Private DNS Resolutie via Web App SSH Terminal
+Vanuit de Linux Web App SSH console zijn DNS-queries uitgevoerd naar de publieke FQDN's van de PaaS-diensten:
 ```bash
 root@1e57e3e8b822:/home/site/wwwroot# nslookup sql-zt-9935.database.windows.net
+Server:    127.0.0.11
+Address:   127.0.0.11#53
+
 Non-authoritative answer:
 sql-zt-9935.database.windows.net       canonical name = sql-zt-9935.privatelink.database.windows.net.
 Name:   sql-zt-9935.privatelink.database.windows.net
 Address: 10.20.2.5
 
 root@1e57e3e8b822:/home/site/wwwroot# nslookup kv-zt-26595.vault.azure.net
+Server:    127.0.0.11
+Address:   127.0.0.11#53
+
 Non-authoritative answer:
 kv-zt-26595.vault.azure.net            canonical name = kv-zt-26595.privatelink.vaultcore.azure.net.
 Name:   kv-zt-26595.privatelink.vaultcore.azure.net
 Address: 10.20.2.4
 ```
+**Conclusie**: De applicatie gebruikt transparant de officiële Azure URL's, maar het verkeer wordt via Private DNS en Private Link binnendoor gerouteerd naar interne IP-adressen (`10.20.2.5` en `10.20.2.4`). Publieke blootstelling is nul.
 
 ---
 
-## 💡 Troubleshooting & Geleerde Lessen
+## 💡 Troubleshooting & Incident Response
 
-Tijdens de uitrol zijn verschillende reële enterprise scenario's opgelost:
-1. **Regionale Quota & Datacenter Capaciteit**: West Europe en North Europe hadden quota-restricties voor SQL en Linux VMs. Door de services flexibel te deployen in France Central en Private DNS links te benutten, werd dit direct omzeild.
-2. **Resource Provider Registratie**: `Microsoft.KeyVault` en `Microsoft.Sql` moesten expliciet via de CLI worden geregistreerd in de subscription (`az provider register`).
-3. **Subnet Delegatie**: Regional VNet Integration vereist strikt een subnet met delegatie naar `Microsoft.Web/serverFarms`.
-4. **Wachtwoordloze Architectuur**: Het uitsluiten van connection strings ten gunste van Entra ID Managed Identity en Azure RBAC voorkomt credential leaks in Git.
+| Uitdaging / Foutmelding | Oorzaak | Toegepaste Oplossing |
+|---|---|---|
+| `RequestDisallowedByAzure` & `RegionDoesNotAllowProvisioning` | Quota- en capaciteitsstops in West Europe en North Europe voor nieuwe SQL/VNet resources. | Architectuur verplaatst naar France Central; Private DNS links garanderen transparante multiregionale connectiviteit. |
+| `MissingSubscriptionRegistration` (`Microsoft.KeyVault`) | Provider namespace was niet geregistreerd in de subscription. | Handmatige CLI registratie via `az provider register --namespace Microsoft.KeyVault` en `Microsoft.Sql`. |
+| `InvalidResourceGroupLocation` | Bestaande Resource Group kan niet van datacenter-locatie wijzigen. | Lege resource group verwijderd via `az group delete` en opnieuw aangemaakt in de juiste regio met dynamische `$RANDOM` naming. |
+| `Current Limit (B1 VMs): 0` | Subscription had 0 vCPU quota voor B1 Linux VMs in North Europe. | Web App uitgerold in France Central waar de Basic SKU wel direct beschikbaar was. |
+| Pre-flight validatiefout in Web App Wizard | Portal kan VNet-integratie niet binden aan een nog niet-bestaande app. | App Service eerst aangemaakt met VNet uitgeschakeld; daarna met 1 klik gekoppeld via het Networking-menu. |
+
+---
+
+## 🎓 Wat Heb Ik Geleerd?
+
+- **Zero-Trust PaaS Architectuur**: Hoe enterprise organisaties voldoen aan ISO 27001 en NIS2 door PaaS-diensten volledig af te sluiten van het openbare internet.
+- **Azure Private Link & DNS**: De werking van CNAME-aliassen en hoe Private DNS Zones automatisch communicatie over het interne netwerk afdwingen zonder applicatie-wijzigingen.
+- **Subnet Delegation & Route All**: Waarom een App Service een dedicated subnet vereist en hoe alle uitgaande netwerkstromen via het VNet worden gedwongen.
+- **Wachtwoordloos Ontwikkelen (IAM)**: Waarom Managed Identities superieur zijn aan connection strings met statische wachtwoorden.
+- **Troubleshooting Onder Druk**: Snel schakelen bij cloud datacenter restricties, quota-limieten en IAM permissiefouten.
 
 ---
 
@@ -114,12 +157,11 @@ Tijdens de uitrol zijn verschillende reële enterprise scenario's opgelost:
 ```text
 azure-zero-trust-paas-lab/
 ├── documentatie/
-│   ├── Azure_Zero_Trust_PaaS_Lab_Rapport.docx  # Het officiële, rijk opgemaakte Word rapport
-│   └── zero-trust-paas-architectuur.md        # Volledige technische documentatie
+│   ├── Azure_Zero_Trust_PaaS_Lab_Rapport.docx           # Officieel Word rapport met alle 37 screenshots
+│   ├── zero-trust-paas-architectuur-en-handleiding.md  # Uitgebreide handleiding en architectuur
+│   └── troubleshooting-scenario.md                     # Gedetailleerde incident logs en oplossingen
 ├── scripts/
-│   ├── deploy.ps1                             # PowerShell geautomatiseerde uitrol
-│   ├── cleanup.ps1                            # Opruimscript om Azure kosten te voorkomen
-│   └── generate_word_report.py                # Script voor Word-rapport generatie
-├── Screenshots/                               # Alle 37 gevalideerde screenshots en foutoplossingen
-└── README.md                                  # Portfolio documentatie
+│   └── cleanup.ps1                                     # Geautomatiseerd opruimscript (kostenpreventie)
+├── Screenshots/                                        # 37 verscherpte bewijsscreenshots (01 t/m 37)
+└── README.md                                           # Dit portfolio document
 ```
